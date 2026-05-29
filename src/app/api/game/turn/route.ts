@@ -12,7 +12,13 @@ export async function POST(req: Request) {
 
     if (isGamePlayComplete(state)) {
       return NextResponse.json({
-        state: { ...state, phase: "voting" as const },
+        state: {
+          ...state,
+          phase: "deliberation" as const,
+          turnIndex: 0,
+          currentRound: state.config.rounds,
+          deliberation: state.deliberation ?? [],
+        },
         done: true,
       });
     }

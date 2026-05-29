@@ -26,12 +26,29 @@ interface TurnResponse {
   error?: string;
 }
 
+interface DeliberationResponse {
+  state: GameState;
+  speech: string;
+  audioBase64?: string;
+}
+
+interface VoteTurnResponse {
+  state: GameState;
+  announcement: string;
+  accusedId: PlayerId;
+  audioBase64?: string;
+  revealed?: boolean;
+}
+
 export default function GameBoard({
   initialState,
   hideImposterUntilReveal = true,
   onReset,
 }: Props) {
-  const [state, setState] = useState<GameState>(initialState);
+  const [state, setState] = useState<GameState>({
+    ...initialState,
+    deliberation: initialState.deliberation ?? [],
+  });
   const [busy, setBusy] = useState(false);
   const [speakingPlayer, setSpeakingPlayer] = useState<PlayerId | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -39,49 +56,85 @@ export default function GameBoard({
     word: string;
     commentary: string;
     playerId: PlayerId;
+    mode: "word" | "speech" | "vote";
   } | null>(null);
   const autoPlay = useRef(false);
 
-  const applyTurnResult = useCallback(
-    async (data: TurnResponse, previousState: GameState) => {
-      if (data.done) {
-        setState(data.state);
-        setSpeakingPlayer(null);
-        return data.state;
-      }
-
-      const entry = data.state.publicLog[data.state.publicLog.length - 1];
-      const playerId = entry?.playerId;
-      const word = data.word ?? entry?.word ?? "";
-      const commentary = data.commentary ?? entry?.commentary ?? "";
-
-      if (playerId) {
-        setLastLine({ word, commentary, playerId });
-        setSpeakingPlayer(playerId);
-      }
-      setState(data.state);
-
-      await waitForTurnAudio(word, commentary, data.audioBase64);
-
-      if (data.earlyVoteAudio?.length) {
-        for (const clip of data.earlyVoteAudio) {
-          setSpeakingPlayer(clip.playerId);
-          await playAudioAndWait(clip.base64);
-        }
-      }
-
+  const applyTurnResult = useCallback(async (data: TurnResponse) => {
+    if (data.done) {
+      setState({
+        ...data.state,
+        deliberation: data.state.deliberation ?? [],
+      });
       setSpeakingPlayer(null);
-
-      if (data.earlyVoteDenied) {
-        setError(
-          "Early vote called too soon — need at least one full round of words first."
-        );
-      }
-
       return data.state;
-    },
-    []
-  );
+    }
+
+    const entry = data.state.publicLog[data.state.publicLog.length - 1];
+    const playerId = entry?.playerId;
+    const word = data.word ?? entry?.word ?? "";
+    const commentary = data.commentary ?? entry?.commentary ?? "";
+
+    if (playerId) {
+      setLastLine({ word, commentary, playerId, mode: "word" });
+      setSpeakingPlayer(playerId);
+    }
+    setState(data.state);
+
+    await waitForTurnAudio(word, commentary, data.audioBase64);
+
+    if (data.earlyVoteAudio?.length) {
+      for (const clip of data.earlyVoteAudio) {
+        setSpeakingPlayer(clip.playerId);
+        await playAudioAndWait(clip.base64);
+      }
+    }
+
+    setSpeakingPlayer(null);
+
+    if (data.earlyVoteDenied) {
+      setError(
+        "Early vote called too soon — need at least one full round of words first."
+      );
+    }
+
+    return data.state;
+  }, []);
+
+  const applyDeliberation = useCallback(async (data: DeliberationResponse) => {
+    const playerId =
+      data.state.deliberation[data.state.deliberation.length - 1]?.playerId;
+    if (playerId) {
+      setLastLine({
+        word: data.speech,
+        commentary: "",
+        playerId,
+        mode: "speech",
+      });
+      setSpeakingPlayer(playerId);
+    }
+    setState(data.state);
+    if (data.audioBase64) await playAudioAndWait(data.audioBase64);
+    setSpeakingPlayer(null);
+    return data.state;
+  }, []);
+
+  const applyVoteTurn = useCallback(async (data: VoteTurnResponse) => {
+    const voterId = data.state.votes[data.state.votes.length - 1]?.voterId;
+    if (voterId) {
+      setLastLine({
+        word: data.announcement,
+        commentary: `→ ${PLAYER_LABELS[data.accusedId]}`,
+        playerId: voterId,
+        mode: "vote",
+      });
+      setSpeakingPlayer(voterId);
+    }
+    setState(data.state);
+    if (data.audioBase64) await playAudioAndWait(data.audioBase64);
+    setSpeakingPlayer(null);
+    return data.state;
+  }, []);
 
   const fetchTurn = useCallback(async (s: GameState): Promise<TurnResponse> => {
     const res = await fetch("/api/game/turn", {
@@ -94,14 +147,52 @@ export default function GameBoard({
     return data;
   }, []);
 
+  const fetchDeliberation = useCallback(
+    async (s: GameState): Promise<DeliberationResponse> => {
+      const res = await fetch("/api/game/deliberate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ state: s }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "Discussion failed");
+      return data;
+    },
+    []
+  );
+
+  const fetchVoteTurn = useCallback(
+    async (s: GameState): Promise<VoteTurnResponse> => {
+      const res = await fetch("/api/game/vote", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ state: s }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "Vote failed");
+      return data;
+    },
+    []
+  );
+
+  const fetchAllVoting = useCallback(async (s: GameState): Promise<GameState> => {
+    const res = await fetch("/api/game/vote", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ state: s, all: true }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error ?? "Voting failed");
+    return data.state;
+  }, []);
+
   const runNextTurn = useCallback(async () => {
     if (busy || state.phase !== "playing") return;
     setBusy(true);
     setError(null);
-
     try {
       const data = await fetchTurn(state);
-      await applyTurnResult(data, state);
+      await applyTurnResult(data);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Error");
       setSpeakingPlayer(null);
@@ -110,25 +201,51 @@ export default function GameBoard({
     }
   }, [busy, state, fetchTurn, applyTurnResult]);
 
-  const runVotes = useCallback(async () => {
-    if (busy || state.phase !== "voting") return;
+  const runNextDeliberation = useCallback(async () => {
+    if (busy || state.phase !== "deliberation") return;
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch("/api/game/vote", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ state }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "Vote failed");
-      setState(data.state);
+      const data = await fetchDeliberation(state);
+      await applyDeliberation(data);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Error");
+      setSpeakingPlayer(null);
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, state, fetchDeliberation, applyDeliberation]);
+
+  const runNextVote = useCallback(async () => {
+    if (busy || state.phase !== "final_vote") return;
+    setBusy(true);
+    setError(null);
+    try {
+      const data = await fetchVoteTurn(state);
+      await applyVoteTurn(data);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Error");
+      setSpeakingPlayer(null);
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, state, fetchVoteTurn, applyVoteTurn]);
+
+  const runAllVoting = useCallback(async () => {
+    if (busy || (state.phase !== "deliberation" && state.phase !== "final_vote"))
+      return;
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await fetchAllVoting(state);
+      setState(next);
+      setLastLine(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Error");
     } finally {
       setBusy(false);
     }
-  }, [busy, state]);
+  }, [busy, state, fetchAllVoting]);
 
   const runFullGame = useCallback(async () => {
     autoPlay.current = true;
@@ -139,20 +256,19 @@ export default function GameBoard({
     try {
       while (autoPlay.current && s.phase === "playing") {
         const data = await fetchTurn(s);
-        s = await applyTurnResult(data, s);
-        if (data.done || s.phase === "voting") break;
+        s = await applyTurnResult(data);
+        if (data.done || s.phase === "deliberation") break;
       }
 
-      if (autoPlay.current && s.phase === "voting") {
-        const res = await fetch("/api/game/vote", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ state: s }),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error ?? "Vote failed");
-        setState(data.state);
-        s = data.state;
+      while (autoPlay.current && s.phase === "deliberation") {
+        const d = await fetchDeliberation(s);
+        s = await applyDeliberation(d);
+      }
+
+      while (autoPlay.current && s.phase === "final_vote") {
+        const v = await fetchVoteTurn(s);
+        s = await applyVoteTurn(v);
+        if (v.revealed) break;
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Error");
@@ -160,7 +276,15 @@ export default function GameBoard({
     } finally {
       setBusy(false);
     }
-  }, [state, fetchTurn, applyTurnResult]);
+  }, [
+    state,
+    fetchTurn,
+    applyTurnResult,
+    fetchDeliberation,
+    applyDeliberation,
+    fetchVoteTurn,
+    applyVoteTurn,
+  ]);
 
   useEffect(() => {
     return () => {
@@ -173,6 +297,8 @@ export default function GameBoard({
 
   const activeSpeaker = speakingPlayer ?? state.activeSpeaker;
 
+  const deliberation = state.deliberation ?? [];
+
   return (
     <div className="board">
       <div className="scene-wrap">
@@ -182,17 +308,23 @@ export default function GameBoard({
       {lastLine && (
         <div className="bubble" style={{ borderColor: PLAYER_COLORS[lastLine.playerId] }}>
           <strong>{PLAYER_LABELS[lastLine.playerId]}</strong>
-          <span className="word">&ldquo;{lastLine.word}&rdquo;</span>
+          {lastLine.mode === "word" ? (
+            <span className="word">&ldquo;{lastLine.word}&rdquo;</span>
+          ) : (
+            <p className="speech">{lastLine.word}</p>
+          )}
           {lastLine.commentary && <p>{lastLine.commentary}</p>}
         </div>
       )}
 
       <div className="status-bar">
-        <span>
-          Round {Math.min(state.currentRound, state.config.rounds)} /{" "}
-          {state.config.rounds}
-        </span>
-        <span className="phase">{state.phase}</span>
+        {state.phase === "playing" && (
+          <span>
+            Round {Math.min(state.currentRound, state.config.rounds)} /{" "}
+            {state.config.rounds}
+          </span>
+        )}
+        <span className="phase">{state.phase.replace("_", " ")}</span>
         {speakingPlayer && (
           <span className="speaking">
             🔊 {PLAYER_LABELS[speakingPlayer]} speaking…
@@ -217,6 +349,25 @@ export default function GameBoard({
             {e.commentary && <span className="c">{e.commentary}</span>}
           </div>
         ))}
+        {deliberation.map((d, i) => (
+          <div key={`d-${i}`} className="log-row discuss">
+            <span className="tag" style={{ color: PLAYER_COLORS[d.playerId] }}>
+              💬 {PLAYER_LABELS[d.playerId]}
+            </span>
+            <span className="c">{d.speech}</span>
+            {d.accusesId && (
+              <span className="motion">→ {PLAYER_LABELS[d.accusesId]}</span>
+            )}
+          </div>
+        ))}
+        {state.votes.map((v) => (
+          <div key={v.voterId} className="log-row vote">
+            <span className="tag" style={{ color: PLAYER_COLORS[v.voterId] }}>
+              🗳️ {PLAYER_LABELS[v.voterId]}
+            </span>
+            <span className="c">{v.announcement}</span>
+          </div>
+        ))}
         {(state.earlyVoteHistory ?? []).map((ev, i) => (
           <div key={`ev-${i}`} className="log-row event">
             <span className="tag">
@@ -224,7 +375,7 @@ export default function GameBoard({
             </span>
             <span className="c">
               {ev.passed
-                ? "Majority agreed → imposter vote!"
+                ? "Majority agreed → discussion!"
                 : "Denied — game continues."}{" "}
               (
               {ev.ballots
@@ -249,15 +400,9 @@ export default function GameBoard({
           <p>
             The imposter was {PLAYER_LABELS[state.config.imposterId]}.
           </p>
-          <div className="votes">
-            {state.votes.map((v) => (
-              <div key={v.voterId} className="vote-row">
-                <strong>{PLAYER_LABELS[v.voterId]}</strong> accused{" "}
-                <strong>{PLAYER_LABELS[v.accusedId]}</strong>
-                <p>{v.reasoning}</p>
-              </div>
-            ))}
-          </div>
+          <p className="tally-hint">
+            Plurality rules — most votes on the imposter wins it for innocents.
+          </p>
         </div>
       )}
 
@@ -275,14 +420,39 @@ export default function GameBoard({
               disabled={busy}
               onClick={runFullGame}
             >
-              Auto-play all rounds
+              Auto-play to end
             </button>
           </>
         )}
-        {state.phase === "voting" && (
-          <button type="button" disabled={busy} onClick={runVotes}>
-            {busy ? "Voting…" : "Run final votes"}
-          </button>
+        {state.phase === "deliberation" && (
+          <>
+            <button type="button" disabled={busy} onClick={runNextDeliberation}>
+              {busy ? "Speaking…" : "Next statement"}
+            </button>
+            <button
+              type="button"
+              className="secondary"
+              disabled={busy}
+              onClick={runAllVoting}
+            >
+              Auto-play discussion & votes
+            </button>
+          </>
+        )}
+        {state.phase === "final_vote" && (
+          <>
+            <button type="button" disabled={busy} onClick={runNextVote}>
+              {busy ? "Speaking…" : "Next locked vote"}
+            </button>
+            <button
+              type="button"
+              className="secondary"
+              disabled={busy}
+              onClick={runAllVoting}
+            >
+              Finish all votes
+            </button>
+          </>
         )}
         <button type="button" className="ghost" onClick={onReset}>
           New game
@@ -323,6 +493,10 @@ export default function GameBoard({
           font-weight: 700;
           margin: 0.35rem 0;
         }
+        .bubble .speech {
+          margin: 0.35rem 0;
+          line-height: 1.45;
+        }
         .bubble p {
           color: var(--muted);
           font-size: 0.9rem;
@@ -345,7 +519,7 @@ export default function GameBoard({
         }
         .log {
           grid-column: 2;
-          max-height: 220px;
+          max-height: 280px;
           overflow-y: auto;
           background: var(--surface);
           border-radius: 8px;
@@ -379,8 +553,10 @@ export default function GameBoard({
           color: var(--accent);
           font-weight: 600;
         }
-        .log-row.event {
-          background: rgba(201, 162, 39, 0.08);
+        .log-row.event,
+        .log-row.discuss,
+        .log-row.vote {
+          background: rgba(201, 162, 39, 0.06);
         }
         .result {
           grid-column: 1 / -1;
@@ -394,16 +570,10 @@ export default function GameBoard({
         .result.imposter {
           background: #2e1a22;
         }
-        .votes {
-          margin-top: 1rem;
-        }
-        .vote-row {
-          padding: 0.5rem 0;
-          font-size: 0.9rem;
-        }
-        .vote-row p {
+        .tally-hint {
           color: var(--muted);
-          margin-top: 0.25rem;
+          font-size: 0.85rem;
+          margin-top: 0.35rem;
         }
         .error {
           grid-column: 1 / -1;

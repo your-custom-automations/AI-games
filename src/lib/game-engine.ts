@@ -3,14 +3,17 @@ import { synthesizeSpeech, bufferToBase64 } from "./elevenlabs";
 import {
   buildWordPrompt,
   buildVotePrompt,
+  buildDeliberationPrompt,
   buildEarlyVoteBallotPrompt,
   buildJsonRetryPrompt,
 } from "./prompts";
 import {
   parseTurnResponse,
   parseVoteResponse,
+  parseDeliberationResponse,
   parseEarlyBallotResponse,
 } from "./parse-model";
+import { isWordTooRevealing, buildVaguenessRetryLine } from "./clue-guard";
 import type {
   GameConfig,
   GameState,
@@ -19,6 +22,9 @@ import type {
   VoteEntry,
   EarlyVoteEvent,
   EarlyVoteBallotEntry,
+  DeliberationEntry,
+  DeliberationResult,
+  VoteTurnResult,
 } from "./types";
 import { PLAYER_IDS } from "./types";
 
@@ -45,6 +51,7 @@ export function createGame(config: GameConfig): GameState {
     turnIndex: 0,
     publicLog: [],
     earlyVoteHistory: [],
+    deliberation: [],
     votes: [],
     activeSpeaker: null,
   };
@@ -54,8 +61,29 @@ export function getCurrentPlayer(state: GameState): PlayerId {
   return state.turnOrder[state.turnIndex];
 }
 
+/** Early-vote motion: need most players to agree to skip rounds */
 export function majorityNeeded(playerCount: number): number {
   return Math.floor(playerCount / 2) + 1;
+}
+
+/** Final vote: innocents win if the imposter got the most accusations (plurality), not 3/4 of all votes */
+export function didInnocentsWinFinalVote(
+  tallies: Map<PlayerId, number>,
+  imposterId: PlayerId
+): boolean {
+  if (tallies.size === 0) return false;
+
+  let maxVotes = 0;
+  for (const count of tallies.values()) {
+    if (count > maxVotes) maxVotes = count;
+  }
+  if (maxVotes === 0) return false;
+
+  const leaders = Array.from(tallies.entries())
+    .filter(([, count]) => count === maxVotes)
+    .map(([id]) => id);
+
+  return leaders.length === 1 && leaders[0] === imposterId;
 }
 
 export function canRequestEarlyVote(state: GameState): boolean {
@@ -81,14 +109,21 @@ function advanceTurn(state: GameState): GameState {
     currentRound += 1;
   }
 
-  const phase =
-    currentRound > state.config.rounds ? "voting" : state.phase;
+  if (currentRound > state.config.rounds) {
+    return {
+      ...state,
+      turnIndex: 0,
+      currentRound: state.config.rounds,
+      phase: "deliberation",
+      activeSpeaker: null,
+    };
+  }
 
   return {
     ...state,
     turnIndex,
     currentRound,
-    phase,
+    phase: state.phase,
     activeSpeaker: null,
   };
 }
@@ -156,7 +191,10 @@ async function runEarlyVoteBallot(
   const nextState: GameState = {
     ...state,
     earlyVoteHistory: [...state.earlyVoteHistory, event],
-    phase: passed ? "voting" : state.phase,
+    phase: passed ? "deliberation" : state.phase,
+    turnIndex: passed ? 0 : state.turnIndex,
+    deliberation: passed ? [] : state.deliberation,
+    votes: passed ? [] : state.votes,
     activeSpeaker: null,
   };
 
@@ -173,7 +211,13 @@ export async function runTurn(state: GameState): Promise<TurnResult> {
 
   const playerId = getCurrentPlayer(state);
   const isImposter = playerId === state.config.imposterId;
-  const { system, user } = buildWordPrompt(state, playerId, isImposter);
+  const allowCommentary = Math.random() < 0.5;
+  const { system, user } = buildWordPrompt(
+    state,
+    playerId,
+    isImposter,
+    allowCommentary
+  );
 
   let raw = await chatAsPlayer(playerId, system, user, { jsonMode: true });
   let parsed;
@@ -189,9 +233,29 @@ export async function runTurn(state: GameState): Promise<TurnResult> {
     parsed = parseTurnResponse(raw);
   }
 
+  if (
+    !parsed.callVoteOnly &&
+    !isImposter &&
+    isWordTooRevealing(
+      parsed.word,
+      state.config.character,
+      state.currentRound,
+      state.config.rounds,
+      false
+    )
+  ) {
+    raw = await chatAsPlayer(
+      playerId,
+      system,
+      `${user}\n\n${buildVaguenessRetryLine(parsed.word, state.currentRound, state.config.rounds)}`,
+      { jsonMode: true }
+    );
+    parsed = parseTurnResponse(raw);
+  }
+
   const callVote = parsed.callVote || parsed.callVoteOnly;
   const word = parsed.callVoteOnly ? "" : parsed.word;
-  const commentary = parsed.commentary;
+  const commentary = allowCommentary ? parsed.commentary : "";
 
   let audioBase64: string | undefined;
   let workingState = state;
@@ -257,52 +321,163 @@ export async function runTurn(state: GameState): Promise<TurnResult> {
   };
 }
 
-export async function runVotePhase(state: GameState): Promise<GameState> {
-  if (state.phase !== "voting") {
-    throw new Error("Not in voting phase");
-  }
+function advanceVotingTurn(state: GameState): GameState {
+  let turnIndex = state.turnIndex + 1;
+  let phase = state.phase;
 
-  const votes: VoteEntry[] = [];
-
-  for (const voterId of state.turnOrder) {
-    const { system, user } = buildVotePrompt(state, voterId);
-    let raw = await chatAsPlayer(voterId, system, user, { jsonMode: true });
-    let parsed;
-    try {
-      parsed = parseVoteResponse(raw, voterId);
-    } catch {
-      raw = await chatAsPlayer(
-        voterId,
-        system,
-        `${user}\n\n${buildJsonRetryPrompt("vote")}`,
-        { jsonMode: true }
-      );
-      parsed = parseVoteResponse(raw, voterId);
+  if (turnIndex >= state.turnOrder.length) {
+    turnIndex = 0;
+    if (phase === "deliberation") {
+      phase = "final_vote";
     }
-
-    votes.push({
-      voterId,
-      accusedId: parsed.accusedId,
-      reasoning: parsed.reasoning,
-    });
   }
 
+  return { ...state, turnIndex, phase, activeSpeaker: null };
+}
+
+function finalizeVotes(state: GameState): GameState {
   const tallies = new Map<PlayerId, number>();
-  for (const v of votes) {
+  for (const v of state.votes) {
     tallies.set(v.accusedId, (tallies.get(v.accusedId) ?? 0) + 1);
   }
 
-  const imposterVotes = tallies.get(state.config.imposterId) ?? 0;
-  const needed = majorityNeeded(state.turnOrder.length);
-  const innocentsWin = imposterVotes >= needed;
+  const innocentsWin = didInnocentsWinFinalVote(
+    tallies,
+    state.config.imposterId
+  );
 
   return {
     ...state,
-    votes,
     phase: "revealed",
     winner: innocentsWin ? "innocents" : "imposter",
     activeSpeaker: null,
   };
+}
+
+export async function runDeliberationTurn(
+  state: GameState
+): Promise<DeliberationResult> {
+  if (state.phase !== "deliberation") {
+    throw new Error("Not in deliberation phase");
+  }
+
+  const playerId = getCurrentPlayer(state);
+  const isImposter = playerId === state.config.imposterId;
+  const { system, user } = buildDeliberationPrompt(state, playerId, isImposter);
+
+  let raw = await chatAsPlayer(playerId, system, user, { jsonMode: true });
+  let parsed;
+  try {
+    parsed = parseDeliberationResponse(raw, playerId);
+  } catch {
+    raw = await chatAsPlayer(
+      playerId,
+      system,
+      `${user}\n\n${buildJsonRetryPrompt("deliberation")}`,
+      { jsonMode: true }
+    );
+    parsed = parseDeliberationResponse(raw, playerId);
+  }
+
+  const entry: DeliberationEntry = {
+    playerId,
+    speech: parsed.speech,
+    accusesId: parsed.accusesId,
+    role: parsed.role,
+  };
+
+  let audioBase64: string | undefined;
+  const audio = await synthesizeSpeech(playerId, parsed.speech);
+  if (audio) audioBase64 = bufferToBase64(audio);
+
+  const withEntry = {
+    ...state,
+    deliberation: [...state.deliberation, entry],
+    activeSpeaker: playerId,
+  };
+
+  const next = advanceVotingTurn(withEntry);
+
+  return { state: next, speech: parsed.speech, audioBase64 };
+}
+
+export async function runFinalVoteTurn(
+  state: GameState
+): Promise<VoteTurnResult> {
+  if (state.phase !== "final_vote") {
+    throw new Error("Not in final vote phase");
+  }
+
+  const voterId = getCurrentPlayer(state);
+  const { system, user } = buildVotePrompt(state, voterId);
+
+  let raw = await chatAsPlayer(voterId, system, user, { jsonMode: true });
+  let parsed;
+  try {
+    parsed = parseVoteResponse(raw, voterId);
+  } catch {
+    raw = await chatAsPlayer(
+      voterId,
+      system,
+      `${user}\n\n${buildJsonRetryPrompt("vote")}`,
+      { jsonMode: true }
+    );
+    parsed = parseVoteResponse(raw, voterId);
+  }
+
+  const announcement =
+    parsed.announcement ||
+    `I vote for ${parsed.accusedId}. ${parsed.reasoning}`.trim();
+
+  let audioBase64: string | undefined;
+  const audio = await synthesizeSpeech(voterId, announcement);
+  if (audio) audioBase64 = bufferToBase64(audio);
+
+  const vote: VoteEntry = {
+    voterId,
+    accusedId: parsed.accusedId,
+    announcement,
+    reasoning: parsed.reasoning,
+  };
+
+  const withVote = {
+    ...state,
+    votes: [...state.votes, vote],
+    activeSpeaker: voterId,
+  };
+
+  let next = advanceVotingTurn(withVote);
+
+  let revealed = false;
+  if (next.votes.length >= state.turnOrder.length) {
+    next = finalizeVotes(next);
+    revealed = true;
+  }
+
+  return {
+    state: next,
+    announcement,
+    accusedId: parsed.accusedId,
+    audioBase64,
+    revealed,
+  };
+}
+
+/** Run all remaining deliberation + final votes (auto-play) */
+export async function runFullVotingSequence(
+  state: GameState
+): Promise<GameState> {
+  let s = state;
+  while (s.phase === "deliberation") {
+    const r = await runDeliberationTurn(s);
+    s = r.state;
+  }
+  while (s.phase === "final_vote") {
+    const r = await runFinalVoteTurn(s);
+    s = r.state;
+    if (r.revealed) break;
+  }
+  return s;
 }
 
 export function tallyVotes(state: GameState): Map<PlayerId, number> {

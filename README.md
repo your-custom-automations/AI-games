@@ -40,16 +40,16 @@ Open [http://localhost:3000](http://localhost:3000).
 2. Enter the **category** the imposter sees (e.g. `famous actor`).
 3. Pick which AI is the **imposter**.
 4. Click **Start game** — turn order is randomized.
-5. Use **Next word** for one turn, or **Auto-play all rounds** to run all 5 rounds + voting.
-6. After 5 rounds, run **final votes** (or let auto-play handle it).
+5. Use **Next word** for one turn, or **Auto-play all rounds** to run all 3 rounds + voting.
+6. After 3 rounds, run **final votes** (or let auto-play handle it).
 
 ## Game rules (summary)
 
 - Three AIs receive the exact character in their private prompt.
 - One AI (the imposter) only receives the category.
 - Each turn: exactly **one word** plus optional commentary (shown in the UI and spoken via ElevenLabs).
-- **5 rounds** — each player speaks once per round.
-- Voting phase: each AI accuses someone; majority vote reveals whether the imposter was caught.
+- **3 rounds** — each player speaks once per round.
+- Voting phase: each AI accuses someone; **innocents win if the imposter gets the most votes** (e.g. 2–1–1 against the imposter is enough), not a fixed 3-of-4 threshold.
 
 ## Model IDs (OpenRouter)
 

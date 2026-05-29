@@ -41,10 +41,26 @@ export interface EarlyVoteEvent {
 export interface VoteEntry {
   voterId: PlayerId;
   accusedId: PlayerId;
+  /** What they said out loud when locking their vote */
+  announcement: string;
   reasoning: string;
 }
 
-export type GamePhase = "setup" | "playing" | "voting" | "revealed";
+/** Public accusation / defense before final votes */
+export interface DeliberationEntry {
+  playerId: PlayerId;
+  speech: string;
+  /** Who they are accusing in this speech, if anyone */
+  accusesId?: PlayerId;
+  role: "accuse" | "defend" | "discuss";
+}
+
+export type GamePhase =
+  | "setup"
+  | "playing"
+  | "deliberation"
+  | "final_vote"
+  | "revealed";
 
 export interface GameConfig {
   character: string;
@@ -66,6 +82,8 @@ export interface GameState {
   publicLog: WordEntry[];
   /** Early-vote motions (call vote before all rounds finish) */
   earlyVoteHistory: EarlyVoteEvent[];
+  /** Public discussion before locked votes */
+  deliberation: DeliberationEntry[];
   votes: VoteEntry[];
   /** Last speaker for 3D animation */
   activeSpeaker: PlayerId | null;
@@ -83,4 +101,18 @@ export interface TurnResult {
   earlyVoteAudio?: { playerId: PlayerId; base64: string }[];
   /** Called for vote but table wasn't ready (need at least one full round of words) */
   earlyVoteDenied?: boolean;
+}
+
+export interface DeliberationResult {
+  state: GameState;
+  speech: string;
+  audioBase64?: string;
+}
+
+export interface VoteTurnResult {
+  state: GameState;
+  announcement: string;
+  accusedId: PlayerId;
+  audioBase64?: string;
+  revealed?: boolean;
 }

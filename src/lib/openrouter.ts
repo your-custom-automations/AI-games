@@ -7,7 +7,7 @@ export async function chatAsPlayer(
   playerId: PlayerId,
   system: string,
   user: string,
-  options?: { jsonMode?: boolean }
+  options?: { jsonMode?: boolean; temperature?: number }
 ): Promise<string> {
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) {
@@ -16,10 +16,13 @@ export async function chatAsPlayer(
 
   const model = getPlayer(playerId).openRouterModel;
 
+  const defaultTemp =
+    playerId === "gemini" ? 0.62 : playerId === "grok" ? 0.85 : 0.78;
+
   const body: Record<string, unknown> = {
     model,
-    temperature: 0.7,
-    max_tokens: 120,
+    temperature: options?.temperature ?? defaultTemp,
+    max_tokens: 160,
     messages: [
       { role: "system", content: system },
       { role: "user", content: user },

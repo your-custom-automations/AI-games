@@ -20,15 +20,16 @@ export default function GameSetup({ onStart, loading }: Props) {
   const [character, setCharacter] = useState("Chris Hemsworth");
   const [category, setCategory] = useState("famous actor");
   const [imposterId, setImposterId] = useState<PlayerId>("gemini");
-  const [rounds, setRounds] = useState(5);
+  const [rounds, setRounds] = useState(3);
 
   return (
     <div className="setup">
       <header>
         <h1>Who&apos;s the Imposter?</h1>
         <p className="subtitle">
-          Four AIs — ChatGPT, Claude, Gemini & Grok — powered by{" "}
-          <strong>OpenRouter</strong>, voiced by <strong>ElevenLabs</strong>.
+          Four unhinged AIs — ChatGPT, Claude, Gemini & Grok — roast each other
+          while hunting the imposter. Powered by <strong>OpenRouter</strong>,
+          voiced by <strong>ElevenLabs</strong>.
         </p>
       </header>
 

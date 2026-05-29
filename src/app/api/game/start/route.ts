@@ -19,7 +19,7 @@ export async function POST(req: Request) {
       character: parsed.character,
       category: parsed.category,
       imposterId: parsed.imposterId,
-      rounds: parsed.rounds ?? 5,
+      rounds: parsed.rounds ?? 3,
     };
 
     if (!process.env.OPENROUTER_API_KEY) {
@@ -40,6 +40,6 @@ export async function POST(req: Request) {
 export async function GET() {
   return NextResponse.json({
     players: PLAYER_IDS,
-    defaultRounds: 5,
+    defaultRounds: 3,
   });
 }

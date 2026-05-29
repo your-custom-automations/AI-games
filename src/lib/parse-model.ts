@@ -9,8 +9,17 @@ function stripCodeFences(text: string): string {
 
 function tryParseObject(raw: string): Record<string, unknown> | null {
   const cleaned = stripCodeFences(raw);
-  const candidates: string[] = [];
 
+  try {
+    const direct = JSON.parse(cleaned) as unknown;
+    if (direct && typeof direct === "object" && !Array.isArray(direct)) {
+      return direct as Record<string, unknown>;
+    }
+  } catch {
+    /* fall through */
+  }
+
+  const candidates: string[] = [];
   const fenceMatch = cleaned.match(/\{[\s\S]*\}/);
   if (fenceMatch) candidates.push(fenceMatch[0]);
 
@@ -75,10 +84,23 @@ function extractCommentaryFromProse(text: string): string {
 
 function parsePlayerId(raw: string): PlayerId | null {
   const lower = raw.toLowerCase().trim();
+  if (!lower) return null;
   for (const id of PLAYER_IDS) {
-    if (lower === id || lower.includes(id)) return id;
+    if (lower === id) return id;
+  }
+  for (const id of PLAYER_IDS) {
+    if (lower.includes(id)) return id;
   }
   return null;
+}
+
+/** Never allow self-accusation — pick another player if needed */
+export function resolveAccused(
+  voterId: PlayerId,
+  accusedId: PlayerId | null
+): PlayerId {
+  if (accusedId && accusedId !== voterId) return accusedId;
+  return PLAYER_IDS.find((id) => id !== voterId)!;
 }
 
 export interface ParsedTurn {
@@ -96,7 +118,14 @@ export interface ParsedEarlyBallot {
 
 export interface ParsedVote {
   accusedId: PlayerId;
+  announcement: string;
   reasoning: string;
+}
+
+export interface ParsedDeliberation {
+  speech: string;
+  accusesId?: PlayerId;
+  role: "accuse" | "defend" | "discuss";
 }
 
 function pickBool(obj: Record<string, unknown>, keys: string[]): boolean {
@@ -160,26 +189,96 @@ export function parseEarlyBallotResponse(raw: string): ParsedEarlyBallot {
 export function parseVoteResponse(raw: string, voterId: PlayerId): ParsedVote {
   const obj = tryParseObject(raw);
   if (obj) {
-    const accusedRaw = pickString(obj, ["accused", "vote", "target", "player"]);
-    const accusedId = parsePlayerId(accusedRaw);
-    if (accusedId && accusedId !== voterId) {
-      let reasoning = pickString(obj, ["reasoning", "reason", "commentary"]);
-      if (reasoning.length > 200) {
-        reasoning = reasoning.slice(0, 197) + "…";
-      }
-      return { accusedId, reasoning };
+    const accusedRaw = pickString(obj, [
+      "accused",
+      "accusedId",
+      "vote",
+      "target",
+      "player",
+    ]);
+    const accusedId = resolveAccused(voterId, parsePlayerId(accusedRaw));
+    let announcement = pickString(obj, [
+      "announcement",
+      "speech",
+      "say",
+      "voteSpeech",
+    ]);
+    if (!announcement) {
+      announcement = pickString(obj, ["reasoning", "reason", "commentary"]);
     }
+    if (announcement.length > 280) {
+      announcement = announcement.slice(0, 277) + "…";
+    }
+    let reasoning = pickString(obj, ["reasoning", "reason"]);
+    if (reasoning.length > 200) {
+      reasoning = reasoning.slice(0, 197) + "…";
+    }
+    return { accusedId, announcement, reasoning };
   }
 
   for (const id of PLAYER_IDS) {
     if (id === voterId) continue;
     const re = new RegExp(`\\b${id}\\b`, "i");
     if (re.test(raw)) {
-      return { accusedId: id, reasoning: "" };
+      return { accusedId: id, announcement: "", reasoning: "" };
     }
+  }
+
+  const accusedMatch = raw.match(
+    /"accused"\s*:\s*"(chatgpt|claude|gemini|grok)"/i
+  );
+  if (accusedMatch) {
+    const accusedId = resolveAccused(
+      voterId,
+      accusedMatch[1].toLowerCase() as PlayerId
+    );
+    return {
+      accusedId,
+      announcement: `I vote for ${accusedId}.`,
+      reasoning: "",
+    };
   }
 
   throw new Error(
     `Model did not return valid vote JSON. Got: ${raw.slice(0, 120)}…`
+  );
+}
+
+export function parseDeliberationResponse(
+  raw: string,
+  speakerId: PlayerId
+): ParsedDeliberation {
+  const obj = tryParseObject(raw);
+  if (obj) {
+    let speech = pickString(obj, ["speech", "say", "line", "commentary"]);
+    if (speech.length > 320) speech = speech.slice(0, 317) + "…";
+
+    const accusesRaw = pickString(obj, [
+      "accuses",
+      "accused",
+      "accusesId",
+      "target",
+    ]);
+    const accusesId = parsePlayerId(accusesRaw) ?? undefined;
+    const roleRaw = pickString(obj, ["role"]).toLowerCase();
+    let role: ParsedDeliberation["role"] = "discuss";
+    if (roleRaw.includes("accuse") || accusesId) role = "accuse";
+    else if (roleRaw.includes("defend")) role = "defend";
+
+    if (!speech) {
+      speech = accusesId
+        ? `I'm calling out ${accusesId} — something's off.`
+        : "I don't buy this table at all.";
+    }
+
+    return {
+      speech,
+      accusesId: accusesId && accusesId !== speakerId ? accusesId : undefined,
+      role,
+    };
+  }
+
+  throw new Error(
+    `Model did not return valid deliberation JSON. Got: ${raw.slice(0, 120)}…`
   );
 }
