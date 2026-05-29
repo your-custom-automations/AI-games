@@ -1,0 +1,28 @@
+{
+  "name": "ai-imposter",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "clean": "node -e \"const fs=require('fs');for (const p of ['.next','node_modules/.cache']) { try { fs.rmSync(p,{recursive:true,force:true}); console.log('removed',p); } catch(e) {} }\""
+  },
+  "dependencies": {
+    "@react-three/drei": "^9.117.3",
+    "@react-three/fiber": "^8.17.10",
+    "next": "^14.2.18",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "three": "^0.170.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.6",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@types/three": "^0.170.0",
+    "typescript": "^5.6.3"
+  }
+}
